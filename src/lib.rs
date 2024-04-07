@@ -228,7 +228,10 @@ impl MiniBitcask {
         let db_file_name = self.db_file.file_path.clone();
 
         fs::remove_file(&db_file_name)?;
-        fs::rename(&merge_db_file_name, PathBuf::from(&self.dir_path).join(FILE_NAME))?;
+        fs::rename(
+            &merge_db_file_name,
+            PathBuf::from(&self.dir_path).join(FILE_NAME),
+        )?;
 
         let db_file = DBFile::new(&self.dir_path)?;
         self.db_file = db_file;
@@ -251,7 +254,7 @@ impl MiniBitcask {
         Ok(())
     }
 
-    pub fn exist(&self, key: &[u8]) -> Result<u64, io::Error> {
+    fn exist(&self, key: &[u8]) -> Result<u64, io::Error> {
         if let Some(offset) = self.indexes.get(&String::from_utf8_lossy(key).into_owned()) {
             Ok(*offset)
         } else {
@@ -286,6 +289,11 @@ impl MiniBitcask {
         Ok(())
     }
 
+    pub fn has(&self, key: &[u8]) -> bool {
+        self.indexes
+            .contains_key(&String::from_utf8_lossy(key).to_string())
+    }
+
     fn load_indexes_from_file(&mut self) -> Result<(), io::Error> {
         let mut offset = 0;
         loop {
@@ -316,10 +324,10 @@ impl MiniBitcask {
 #[cfg(test)]
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
-    use dashmap::DashMap;
+
+    use crate::MiniBitcask;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
-    use crate::MiniBitcask;
 
     #[test]
     fn test_open() {
@@ -349,7 +357,6 @@ mod tests {
             mini_bitcask.put(key.as_bytes(), val.as_bytes()).unwrap();
         }
     }
-
 
     fn get_val(db: &mut MiniBitcask, key: &str) {
         let val = db.get(key.as_bytes()).unwrap();
