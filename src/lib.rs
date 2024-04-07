@@ -1,8 +1,7 @@
 use dashmap::DashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, Write};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 const FILE_NAME: &str = "minibitcask.data";
@@ -31,12 +30,12 @@ impl Entry {
         }
     }
 
-    fn size(&self) -> i64 {
-        ENTRY_HEADER_SIZE as i64 + self.key_size as i64 + self.value_size as i64
+    fn size(&self) -> usize {
+        ENTRY_HEADER_SIZE + self.key_size as usize + self.value_size as usize
     }
 
     fn encode(&self) -> Vec<u8> {
-        let mut buf = vec![0; self.size() as usize];
+        let mut buf = vec![0; self.size()];
         buf[0..4].copy_from_slice(&self.key_size.to_be_bytes());
         buf[4..8].copy_from_slice(&self.value_size.to_be_bytes());
         buf[8..10].copy_from_slice(&self.mark.to_be_bytes());
@@ -55,8 +54,8 @@ impl Entry {
         let mark = u16::from_be_bytes([buf[8], buf[9]]);
 
         Ok(Entry {
-            key: buf[ENTRY_HEADER_SIZE..ENTRY_HEADER_SIZE + key_size as usize].to_vec(),
-            value: buf[ENTRY_HEADER_SIZE + key_size as usize..].to_vec(),
+            key: vec![],
+            value: vec![],
             key_size,
             value_size,
             mark,
@@ -66,8 +65,8 @@ impl Entry {
 
 struct DBFile {
     file: File,
-    offset: i64,
-    file_name: String,
+    offset: u64,
+    file_path: String,
 }
 
 impl DBFile {
@@ -79,12 +78,12 @@ impl DBFile {
             .open(file_name)?;
 
         let metadata = file.metadata()?;
-        let offset = metadata.len() as i64;
+        let offset = metadata.len();
 
         Ok(DBFile {
             file,
             offset,
-            file_name: file_name.to_string(),
+            file_path: file_name.to_string(),
         })
     }
 
@@ -98,9 +97,8 @@ impl DBFile {
         DBFile::new_internal(file_name.to_str().unwrap())
     }
 
-    fn read(&mut self, offset: i64) -> Result<Entry, std::io::Error> {
-        let mut buf = Vec::new();
-        buf.reserve_exact(ENTRY_HEADER_SIZE);
+    fn read(&mut self, offset: u64) -> Result<Entry, std::io::Error> {
+        let mut buf = vec![0; ENTRY_HEADER_SIZE];
         self.file.read_exact_at_offset(&mut buf, offset)?;
         let mut entry = Entry::decode(&buf)?;
 
@@ -109,13 +107,13 @@ impl DBFile {
 
         if entry.key_size > 0 {
             self.file
-                .read_exact_at_offset(&mut key, offset + ENTRY_HEADER_SIZE as i64)?;
+                .read_exact_at_offset(&mut key, offset + ENTRY_HEADER_SIZE as u64)?;
         }
 
         if entry.value_size > 0 {
             self.file.read_exact_at_offset(
                 &mut value,
-                offset + ENTRY_HEADER_SIZE as i64 + entry.key_size as i64,
+                offset + ENTRY_HEADER_SIZE as u64 + entry.key_size as u64,
             )?;
         }
 
@@ -128,43 +126,43 @@ impl DBFile {
     fn write(&mut self, entry: &Entry) -> Result<(), std::io::Error> {
         let encoded = entry.encode();
         self.file.write_all_at_offset(&encoded, self.offset)?;
-        self.offset += entry.size();
+        self.offset += entry.size() as u64;
         Ok(())
     }
 }
 
 trait FileReadAt {
-    fn read_exact_at_offset(&mut self, buf: &mut [u8], offset: i64) -> Result<(), std::io::Error>;
+    fn read_exact_at_offset(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error>;
 }
 
 trait FileWriteAt {
-    fn write_all_at_offset(&mut self, buf: &[u8], offset: i64) -> Result<(), std::io::Error>;
+    fn write_all_at_offset(&mut self, buf: &[u8], offset: u64) -> Result<(), std::io::Error>;
 }
 
 impl FileReadAt for File {
-    fn read_exact_at_offset(&mut self, buf: &mut [u8], offset: i64) -> Result<(), std::io::Error> {
-        self.seek(std::io::SeekFrom::Start(offset as u64))?;
+    fn read_exact_at_offset(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
+        self.seek(std::io::SeekFrom::Start(offset))?;
         self.read_exact(buf)?;
         Ok(())
     }
 }
 
 impl FileWriteAt for File {
-    fn write_all_at_offset(&mut self, buf: &[u8], offset: i64) -> Result<(), std::io::Error> {
-        self.seek(std::io::SeekFrom::Start(offset as u64))?;
+    fn write_all_at_offset(&mut self, buf: &[u8], offset: u64) -> Result<(), std::io::Error> {
+        self.seek(std::io::SeekFrom::Start(offset))?;
         self.write_all(buf)?;
         Ok(())
     }
 }
 
 pub struct MiniBitcask {
-    indexes: Arc<DashMap<String, i64>>,
+    indexes: DashMap<String, u64>,
     db_file: DBFile,
     dir_path: String,
 }
 
 impl MiniBitcask {
-    pub fn open(dir_path: &str) -> Result<Self, io::Error> {
+    pub fn open(dir_path: &Path) -> Result<Self, io::Error> {
         if let Err(err) = fs::create_dir_all(dir_path) {
             if err.kind() != io::ErrorKind::AlreadyExists {
                 return Err(err);
@@ -174,7 +172,7 @@ impl MiniBitcask {
         let dir_abs_path = fs::canonicalize(dir_path)?;
         let db_file_path = dir_abs_path.to_string_lossy().to_string();
         let db_file = DBFile::new(&db_file_path)?;
-        let indexes = Arc::new(DashMap::new());
+        let indexes = DashMap::new();
 
         let mut mini_bitcask = MiniBitcask {
             indexes,
@@ -198,14 +196,13 @@ impl MiniBitcask {
             match self.db_file.read(offset) {
                 Ok(e) => {
                     let key = String::from_utf8_lossy(&e.key).to_string();
-                    let indexes = Arc::clone(&self.indexes);
                     let size = e.size();
-                    if let Some(off) = indexes.get(&key) {
+                    if let Some(off) = self.indexes.get(&key) {
                         if *off == offset {
                             valid_entries.push(e);
                         }
                     }
-                    offset += size;
+                    offset += size as u64;
                 }
                 Err(err) => {
                     if err.kind() == io::ErrorKind::UnexpectedEof {
@@ -218,8 +215,8 @@ impl MiniBitcask {
         }
 
         let mut merge_db_file = DBFile::new_merge_db_file(&self.dir_path)?;
-        let merge_db_file_name = merge_db_file.file_name.clone();
-        let merged_indexes = Arc::new(DashMap::new());
+        let merge_db_file_name = merge_db_file.file_path.clone();
+        let merged_indexes = DashMap::new();
 
         for entry in valid_entries {
             let write_off = merge_db_file.offset;
@@ -228,10 +225,10 @@ impl MiniBitcask {
             merged_indexes.insert(String::from_utf8_lossy(&entry.key).into_owned(), write_off);
         }
 
-        let db_file_name = self.db_file.file_name.clone();
+        let db_file_name = self.db_file.file_path.clone();
 
         fs::remove_file(&db_file_name)?;
-        fs::rename(&merge_db_file_name, &db_file_name)?;
+        fs::rename(&merge_db_file_name, PathBuf::from(&self.dir_path).join(FILE_NAME))?;
 
         let db_file = DBFile::new(&self.dir_path)?;
         self.db_file = db_file;
@@ -254,7 +251,7 @@ impl MiniBitcask {
         Ok(())
     }
 
-    pub fn exist(&self, key: &[u8]) -> Result<i64, io::Error> {
+    pub fn exist(&self, key: &[u8]) -> Result<u64, io::Error> {
         if let Some(offset) = self.indexes.get(&String::from_utf8_lossy(key).into_owned()) {
             Ok(*offset)
         } else {
@@ -264,9 +261,8 @@ impl MiniBitcask {
 
     pub fn get(&mut self, key: &[u8]) -> Result<Vec<u8>, io::Error> {
         if key.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "Key not found"));
+            return Err(io::Error::new(io::ErrorKind::NotFound, "Key is empty"));
         }
-
         let offset = self.exist(key)?;
         let entry = self.db_file.read(offset)?;
 
@@ -296,12 +292,13 @@ impl MiniBitcask {
             match self.db_file.read(offset) {
                 Ok(e) => {
                     let key = String::from_utf8_lossy(&e.key).into_owned();
-                    self.indexes.insert(key, offset);
-                    if e.mark == 1 {
+                    if e.mark == 0 {
+                        self.indexes.insert(key, offset);
+                    } else if e.mark == 1 {
                         self.indexes
                             .remove(&String::from_utf8_lossy(&e.key).into_owned());
                     }
-                    offset += e.size();
+                    offset += e.size() as u64;
                 }
                 Err(err) => {
                     if err.kind() == io::ErrorKind::UnexpectedEof {
@@ -318,7 +315,72 @@ impl MiniBitcask {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use dashmap::DashMap;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    use crate::MiniBitcask;
 
     #[test]
-    fn it_works() {}
+    fn test_open() {
+        let temp_dir = std::env::temp_dir();
+        let temp_dir = temp_dir.join("minibitcask");
+        let _ = MiniBitcask::open(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_put() {
+        let temp_dir = std::env::temp_dir();
+        let temp_dir = temp_dir.join("minibitcask");
+        let mut mini_bitcask = MiniBitcask::open(&temp_dir).unwrap();
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Failed to get system time")
+            .as_nanos()
+            .try_into()
+            .expect("Failed to convert seed to u64");
+
+        let mut rng = StdRng::seed_from_u64(seed);
+        let key_prefix = "test_key_";
+        let val_prefix = "test_value_";
+        for i in 0..10000 {
+            let key = format!("{}{}", key_prefix, i % 5);
+            let val = format!("{}{}", val_prefix, rng.gen::<i64>());
+            mini_bitcask.put(key.as_bytes(), val.as_bytes()).unwrap();
+        }
+    }
+
+
+    fn get_val(db: &mut MiniBitcask, key: &str) {
+        let val = db.get(key.as_bytes()).unwrap();
+        println!("{}", String::from_utf8_lossy(&val).to_string());
+    }
+
+    #[test]
+    fn test_get() {
+        let temp_dir = std::env::temp_dir();
+        let temp_dir = temp_dir.join("minibitcask");
+        let mut mini_bitcask = MiniBitcask::open(&temp_dir).unwrap();
+        get_val(&mut mini_bitcask, "test_key_0");
+        get_val(&mut mini_bitcask, "test_key_1");
+        get_val(&mut mini_bitcask, "test_key_2");
+        get_val(&mut mini_bitcask, "test_key_3");
+        get_val(&mut mini_bitcask, "test_key_4");
+    }
+
+    #[test]
+    fn test_del() {
+        let temp_dir = std::env::temp_dir();
+        let temp_dir = temp_dir.join("minibitcask");
+        let mut mini_bitcask = MiniBitcask::open(&temp_dir).unwrap();
+        mini_bitcask.del("test_key_78".as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn test_merge() {
+        let temp_dir = std::env::temp_dir();
+        let temp_dir = temp_dir.join("minibitcask");
+        let mut mini_bitcask = MiniBitcask::open(&temp_dir).unwrap();
+        mini_bitcask.merge().unwrap();
+    }
 }
